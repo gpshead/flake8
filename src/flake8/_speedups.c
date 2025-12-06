@@ -15,10 +15,14 @@
 #define TOK_DEDENT 6
 #define TOK_COMMENT 61
 #define TOK_STRING 3
+#define TOK_ENDMARKER 0
 
 /* Forward declarations */
 static PyObject* build_logical_line_tokens(PyObject* self, PyObject* args);
 static PyObject* mutate_string(PyObject* self, PyObject* args);
+static PyObject* is_eol_token(PyObject* self, PyObject* args);
+static PyObject* is_multiline_string(PyObject* self, PyObject* args);
+static PyObject* noqa_line_mapping(PyObject* self, PyObject* args);
 
 /*
  * mutate_string(text) -> str
@@ -110,6 +114,257 @@ should_skip_token(int token_type)
             token_type == TOK_NEWLINE ||
             token_type == TOK_INDENT ||
             token_type == TOK_DEDENT);
+}
+
+
+/*
+ * is_eol_token(token, newline_types) -> bool
+ *
+ * Check if the token is an end-of-line token.
+ * This is a hot function called for every token during processing.
+ *
+ * Args:
+ *   token: TokenInfo tuple (type, text, start, end, line)
+ *   newline_types: frozenset of newline token types {NL, NEWLINE}
+ *
+ * Returns:
+ *   True if token is end-of-line, False otherwise
+ */
+static PyObject*
+is_eol_token(PyObject* self, PyObject* args)
+{
+    PyObject* token;
+    PyObject* newline_types;
+
+    if (!PyArg_ParseTuple(args, "OO", &token, &newline_types)) {
+        return NULL;
+    }
+
+    if (!PyTuple_Check(token) || PyTuple_GET_SIZE(token) < 5) {
+        Py_RETURN_FALSE;
+    }
+
+    /* Get token type */
+    PyObject* py_token_type = PyTuple_GET_ITEM(token, 0);
+    int token_type = (int)PyLong_AsLong(py_token_type);
+    if (PyErr_Occurred()) {
+        PyErr_Clear();
+        Py_RETURN_FALSE;
+    }
+
+    /* Check if token type is in newline_types */
+    int in_newline = PySet_Contains(newline_types, py_token_type);
+    if (in_newline == 1) {
+        Py_RETURN_TRUE;
+    }
+    if (in_newline == -1) {
+        PyErr_Clear();
+    }
+
+    /* Check for line continuation: token[4][token[3][1]:].lstrip() == "\\\n" */
+    PyObject* py_line = PyTuple_GET_ITEM(token, 4);
+    PyObject* py_end = PyTuple_GET_ITEM(token, 3);
+
+    if (!PyUnicode_Check(py_line) || !PyTuple_Check(py_end) ||
+        PyTuple_GET_SIZE(py_end) < 2) {
+        Py_RETURN_FALSE;
+    }
+
+    Py_ssize_t end_col = PyLong_AsSsize_t(PyTuple_GET_ITEM(py_end, 1));
+    if (PyErr_Occurred()) {
+        PyErr_Clear();
+        Py_RETURN_FALSE;
+    }
+
+    const char* line_str = PyUnicode_AsUTF8(py_line);
+    Py_ssize_t line_len = PyUnicode_GET_LENGTH(py_line);
+
+    if (!line_str || end_col < 0 || end_col > line_len) {
+        Py_RETURN_FALSE;
+    }
+
+    /* Skip whitespace from end_col position */
+    Py_ssize_t i = end_col;
+    while (i < line_len && (line_str[i] == ' ' || line_str[i] == '\t')) {
+        i++;
+    }
+
+    /* Check if remaining is "\\\n" */
+    if (i + 2 <= line_len && line_str[i] == '\\' && line_str[i + 1] == '\n') {
+        Py_RETURN_TRUE;
+    }
+
+    Py_RETURN_FALSE;
+}
+
+
+/*
+ * is_multiline_string(token, fstring_end_type, tstring_end_type) -> bool
+ *
+ * Check if this is a multiline string token.
+ *
+ * Args:
+ *   token: TokenInfo tuple (type, text, start, end, line)
+ *   fstring_end_type: FSTRING_END token type or -1
+ *   tstring_end_type: TSTRING_END token type or -1
+ *
+ * Returns:
+ *   True if token is multiline string, False otherwise
+ */
+static PyObject*
+is_multiline_string(PyObject* self, PyObject* args)
+{
+    PyObject* token;
+    int fstring_end_type;
+    int tstring_end_type;
+
+    if (!PyArg_ParseTuple(args, "Oii", &token, &fstring_end_type, &tstring_end_type)) {
+        return NULL;
+    }
+
+    if (!PyTuple_Check(token) || PyTuple_GET_SIZE(token) < 2) {
+        Py_RETURN_FALSE;
+    }
+
+    PyObject* py_token_type = PyTuple_GET_ITEM(token, 0);
+    int token_type = (int)PyLong_AsLong(py_token_type);
+    if (PyErr_Occurred()) {
+        PyErr_Clear();
+        Py_RETURN_FALSE;
+    }
+
+    /* Check if FSTRING_END or TSTRING_END */
+    if (token_type == fstring_end_type || token_type == tstring_end_type) {
+        Py_RETURN_TRUE;
+    }
+
+    /* Check if STRING with newline */
+    if (token_type == TOK_STRING) {
+        PyObject* py_text = PyTuple_GET_ITEM(token, 1);
+        if (PyUnicode_Check(py_text)) {
+            Py_ssize_t idx = PyUnicode_Find(py_text,
+                PyUnicode_FromString("\n"), 0, PyUnicode_GET_LENGTH(py_text), 1);
+            if (idx >= 0) {
+                Py_RETURN_TRUE;
+            }
+        }
+    }
+
+    Py_RETURN_FALSE;
+}
+
+
+/*
+ * noqa_line_mapping(file_tokens, lines, endmarker_type, dedent_type) -> dict
+ *
+ * Build mapping from line number to the line we'll search for `noqa` in.
+ * This is called once per file but is expensive due to iterating all tokens.
+ *
+ * Args:
+ *   file_tokens: list of all tokens in the file
+ *   lines: list of source lines
+ *   endmarker_type: ENDMARKER token type
+ *   dedent_type: DEDENT token type
+ *
+ * Returns:
+ *   dict mapping line numbers to joined lines for noqa searching
+ */
+static PyObject*
+noqa_line_mapping(PyObject* self, PyObject* args)
+{
+    PyObject* file_tokens;
+    PyObject* lines;
+    int endmarker_type;
+    int dedent_type;
+    int nl_type;
+    int newline_type;
+
+    if (!PyArg_ParseTuple(args, "OOiiii", &file_tokens, &lines,
+                          &endmarker_type, &dedent_type, &nl_type, &newline_type)) {
+        return NULL;
+    }
+
+    if (!PyList_Check(file_tokens) || !PyList_Check(lines)) {
+        PyErr_SetString(PyExc_TypeError, "file_tokens and lines must be lists");
+        return NULL;
+    }
+
+    Py_ssize_t num_tokens = PyList_GET_SIZE(file_tokens);
+    Py_ssize_t num_lines = PyList_GET_SIZE(lines);
+
+    PyObject* ret = PyDict_New();
+    if (!ret) return NULL;
+
+    Py_ssize_t min_line = num_lines + 2;
+    Py_ssize_t max_line = -1;
+
+    for (Py_ssize_t i = 0; i < num_tokens; i++) {
+        PyObject* token = PyList_GET_ITEM(file_tokens, i);
+        if (!PyTuple_Check(token) || PyTuple_GET_SIZE(token) < 4) {
+            continue;
+        }
+
+        int tp = (int)PyLong_AsLong(PyTuple_GET_ITEM(token, 0));
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+            continue;
+        }
+
+        if (tp == endmarker_type || tp == dedent_type) {
+            continue;
+        }
+
+        PyObject* py_start = PyTuple_GET_ITEM(token, 2);
+        PyObject* py_end = PyTuple_GET_ITEM(token, 3);
+
+        if (!PyTuple_Check(py_start) || !PyTuple_Check(py_end)) {
+            continue;
+        }
+
+        Py_ssize_t s_line = PyLong_AsSsize_t(PyTuple_GET_ITEM(py_start, 0));
+        Py_ssize_t e_line = PyLong_AsSsize_t(PyTuple_GET_ITEM(py_end, 0));
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+            continue;
+        }
+
+        if (s_line < min_line) min_line = s_line;
+        if (e_line > max_line) max_line = e_line;
+
+        /* Check for NL or NEWLINE */
+        if (tp == nl_type || tp == newline_type) {
+            /* Update ret with range mapping */
+            if (min_line <= max_line && min_line >= 1 && max_line <= num_lines) {
+                /* Join lines from min_line to max_line */
+                PyObject* parts = PyList_New(0);
+                if (parts) {
+                    for (Py_ssize_t ln = min_line - 1; ln < max_line; ln++) {
+                        PyList_Append(parts, PyList_GET_ITEM(lines, ln));
+                    }
+                    PyObject* empty = PyUnicode_FromString("");
+                    PyObject* joined = PyUnicode_Join(empty, parts);
+                    Py_DECREF(empty);
+                    Py_DECREF(parts);
+
+                    if (joined) {
+                        for (Py_ssize_t ln = min_line; ln <= max_line; ln++) {
+                            PyObject* key = PyLong_FromSsize_t(ln);
+                            if (key) {
+                                PyDict_SetItem(ret, key, joined);
+                                Py_DECREF(key);
+                            }
+                        }
+                        Py_DECREF(joined);
+                    }
+                }
+            }
+
+            min_line = num_lines + 2;
+            max_line = -1;
+        }
+    }
+
+    return ret;
 }
 
 
@@ -393,6 +648,32 @@ static PyMethodDef SpeedupsMethods[] = {
      "    text: string literal including quotes\n\n"
      "Returns:\n"
      "    mutated string"},
+    {"is_eol_token", is_eol_token, METH_VARARGS,
+     "Check if token is an end-of-line token.\n\n"
+     "Args:\n"
+     "    token: TokenInfo tuple\n"
+     "    newline_types: frozenset of newline token types\n\n"
+     "Returns:\n"
+     "    True if end-of-line token, False otherwise"},
+    {"is_multiline_string", is_multiline_string, METH_VARARGS,
+     "Check if token is a multiline string.\n\n"
+     "Args:\n"
+     "    token: TokenInfo tuple\n"
+     "    fstring_end_type: FSTRING_END token type or -1\n"
+     "    tstring_end_type: TSTRING_END token type or -1\n\n"
+     "Returns:\n"
+     "    True if multiline string, False otherwise"},
+    {"noqa_line_mapping", noqa_line_mapping, METH_VARARGS,
+     "Build mapping from line number to noqa search line.\n\n"
+     "Args:\n"
+     "    file_tokens: list of all tokens\n"
+     "    lines: list of source lines\n"
+     "    endmarker_type: ENDMARKER token type\n"
+     "    dedent_type: DEDENT token type\n"
+     "    nl_type: NL token type\n"
+     "    newline_type: NEWLINE token type\n\n"
+     "Returns:\n"
+     "    dict mapping line numbers to joined lines"},
     {NULL, NULL, 0, NULL}
 };
 

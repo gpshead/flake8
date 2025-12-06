@@ -320,25 +320,40 @@ class FileProcessor:
             # if we failed to parse the file tokens, we'll always fail in
             # the future, so set this so the code does not try again
             return {}
-        else:
-            ret = {}
 
-            min_line = len(self.lines) + 2
-            max_line = -1
-            for tp, _, (s_line, _), (e_line, _), _ in file_tokens:
-                if tp == tokenize.ENDMARKER or tp == tokenize.DEDENT:
-                    continue
+        # Try C implementation first
+        if _USE_SPEEDUPS:
+            try:
+                return _speedups.noqa_line_mapping(
+                    file_tokens,
+                    self.lines,
+                    tokenize.ENDMARKER,
+                    tokenize.DEDENT,
+                    tokenize.NL,
+                    tokenize.NEWLINE,
+                )
+            except Exception:
+                pass
 
-                min_line = min(min_line, s_line)
-                max_line = max(max_line, e_line)
+        # Python fallback
+        ret: dict[int, str] = {}
 
-                if tp in (tokenize.NL, tokenize.NEWLINE):
-                    ret.update(self._noqa_line_range(min_line, max_line))
+        min_line = len(self.lines) + 2
+        max_line = -1
+        for tp, _, (s_line, _), (e_line, _), _ in file_tokens:
+            if tp == tokenize.ENDMARKER or tp == tokenize.DEDENT:
+                continue
 
-                    min_line = len(self.lines) + 2
-                    max_line = -1
+            min_line = min(min_line, s_line)
+            max_line = max(max_line, e_line)
 
-            return ret
+            if tp in (tokenize.NL, tokenize.NEWLINE):
+                ret.update(self._noqa_line_range(min_line, max_line))
+
+                min_line = len(self.lines) + 2
+                max_line = -1
+
+        return ret
 
     def noqa_line_for(self, line_number: int) -> str | None:
         """Retrieve the line which will be used to determine noqa."""
@@ -416,11 +431,21 @@ class FileProcessor:
 
 def is_eol_token(token: tokenize.TokenInfo) -> bool:
     """Check if the token is an end-of-line token."""
+    if _USE_SPEEDUPS:
+        try:
+            return _speedups.is_eol_token(token, NEWLINE)
+        except Exception:
+            pass
     return token[0] in NEWLINE or token[4][token[3][1]:].lstrip() == "\\\n"
 
 
 def is_multiline_string(token: tokenize.TokenInfo) -> bool:
     """Check if this is a multiline string."""
+    if _USE_SPEEDUPS:
+        try:
+            return _speedups.is_multiline_string(token, FSTRING_END, TSTRING_END)
+        except Exception:
+            pass
     return token.type in {FSTRING_END, TSTRING_END} or (
         token.type == tokenize.STRING and "\n" in token.string
     )
