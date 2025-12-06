@@ -130,6 +130,63 @@ Type stubs are provided in ``src/flake8/_speedups.pyi`` for mypy and other
 type checkers. This allows proper type checking even when the C extension
 is not available at type-check time.
 
+Free-Threading Support (Python 3.13+)
+=====================================
+
+The C extension supports Python 3.13+ free-threading mode (PEP 703), where
+the Global Interpreter Lock (GIL) is disabled. This allows flake8 to take
+full advantage of multi-core parallelism in free-threaded Python builds.
+
+Implementation Details
+----------------------
+
+The extension declares free-threading support via the ``Py_mod_gil`` slot:
+
+.. code-block:: c
+
+    static PyModuleDef_Slot speedups_slots[] = {
+        {Py_mod_exec, speedups_exec},
+    #if PY_VERSION_HEX >= 0x030D0000
+        {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+    #endif
+        {0, NULL}
+    };
+
+Key design decisions for thread safety:
+
+1. **Immutable globals**: Token constants and cached strings are initialized
+   once at module load time and never modified afterward.
+
+2. **Thread-safe initialization**: On Python 3.13+, module initialization is
+   protected by a ``PyMutex`` to prevent race conditions during concurrent
+   imports.
+
+3. **Stateless functions**: All exported functions are pure - they take inputs
+   and produce outputs without accessing or modifying shared mutable state.
+
+4. **Multi-phase initialization**: The extension uses multi-phase init
+   (``PyModuleDef_Init``) which is required for proper ``Py_mod_gil`` support.
+
+Testing Free-Threading
+----------------------
+
+To test on a free-threaded Python build:
+
+.. code-block:: bash
+
+    # Build Python 3.13t or 3.14t
+    ./configure --disable-gil
+    make
+
+    # Verify GIL is disabled
+    python -c "import sys; print(sys._is_gil_enabled())"  # Should print False
+
+    # Run tests
+    python -m pytest tests/unit/test_speedups.py -v
+
+The test suite includes concurrent stress tests that verify thread safety
+by running multiple threads calling extension functions simultaneously.
+
 Future Work
 ===========
 

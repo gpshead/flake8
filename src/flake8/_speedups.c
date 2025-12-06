@@ -3,6 +3,11 @@
  *
  * This C extension module provides optimized implementations of
  * performance-critical functions identified through profiling.
+ *
+ * Free-threading (PEP 703) support:
+ * - Python 3.13+ with Py_mod_gil slot
+ * - Thread-safe one-time initialization
+ * - All exported functions are stateless and thread-safe
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -11,6 +16,7 @@
 /*
  * Token type constants - dynamically loaded from tokenize module at init.
  * This ensures compatibility across Python versions where token values may differ.
+ * These are effectively immutable after initialization.
  */
 static int TOK_NL = -1;
 static int TOK_NEWLINE = -1;
@@ -20,8 +26,15 @@ static int TOK_COMMENT = -1;
 static int TOK_STRING = -1;
 static int TOK_ENDMARKER = -1;
 
-/* Cached Python objects for performance */
+/* Cached Python objects for performance (immutable after init) */
 static PyObject* NEWLINE_STR = NULL;
+
+/* Thread-safe initialization flag and mutex for Python 3.13+ free-threading */
+#if PY_VERSION_HEX >= 0x030D0000
+#include <pythread.h>
+static int _speedups_initialized = 0;
+static PyMutex _speedups_init_mutex = {0};
+#endif
 
 /*
  * Helper to get an integer attribute from a module.
@@ -723,54 +736,110 @@ static PyMethodDef SpeedupsMethods[] = {
 };
 
 
-/* Module definition */
-static struct PyModuleDef speedupsmodule = {
-    PyModuleDef_HEAD_INIT,
-    "_speedups",
-    "Flake8 performance-critical functions implemented in C",
-    -1,
-    SpeedupsMethods
-};
-
-
-/* Module initialization */
-PyMODINIT_FUNC
-PyInit__speedups(void)
+/*
+ * Module execution function - performs one-time initialization.
+ * Called during module import. Thread-safe for free-threading builds.
+ */
+static int
+speedups_exec(PyObject *module)
 {
+#if PY_VERSION_HEX >= 0x030D0000
+    /* Thread-safe initialization for free-threading builds */
+    PyMutex_Lock(&_speedups_init_mutex);
+    if (_speedups_initialized) {
+        PyMutex_Unlock(&_speedups_init_mutex);
+        return 0;  /* Already initialized */
+    }
+#endif
+
     /* Initialize cached Python objects */
-    NEWLINE_STR = PyUnicode_FromString("\n");
     if (NEWLINE_STR == NULL) {
-        return NULL;
+        NEWLINE_STR = PyUnicode_FromString("\n");
+        if (NEWLINE_STR == NULL) {
+#if PY_VERSION_HEX >= 0x030D0000
+            PyMutex_Unlock(&_speedups_init_mutex);
+#endif
+            return -1;
+        }
     }
 
     /* Load token type constants from tokenize module */
-    PyObject* tokenize = PyImport_ImportModule("tokenize");
-    if (tokenize == NULL) {
-        Py_DECREF(NEWLINE_STR);
-        NEWLINE_STR = NULL;
-        return NULL;
+    if (TOK_NL < 0) {
+        PyObject* tokenize = PyImport_ImportModule("tokenize");
+        if (tokenize == NULL) {
+            Py_CLEAR(NEWLINE_STR);
+#if PY_VERSION_HEX >= 0x030D0000
+            PyMutex_Unlock(&_speedups_init_mutex);
+#endif
+            return -1;
+        }
+
+        TOK_NL = get_int_attr(tokenize, "NL");
+        TOK_NEWLINE = get_int_attr(tokenize, "NEWLINE");
+        TOK_INDENT = get_int_attr(tokenize, "INDENT");
+        TOK_DEDENT = get_int_attr(tokenize, "DEDENT");
+        TOK_COMMENT = get_int_attr(tokenize, "COMMENT");
+        TOK_STRING = get_int_attr(tokenize, "STRING");
+        TOK_ENDMARKER = get_int_attr(tokenize, "ENDMARKER");
+
+        Py_DECREF(tokenize);
+
+        /* Check if any attribute lookup failed */
+        if (TOK_NL < 0 || TOK_NEWLINE < 0 || TOK_INDENT < 0 ||
+            TOK_DEDENT < 0 || TOK_COMMENT < 0 || TOK_STRING < 0 ||
+            TOK_ENDMARKER < 0) {
+            Py_CLEAR(NEWLINE_STR);
+            TOK_NL = -1;  /* Reset to invalid state */
+#if PY_VERSION_HEX >= 0x030D0000
+            PyMutex_Unlock(&_speedups_init_mutex);
+#endif
+            PyErr_SetString(PyExc_RuntimeError,
+                            "Failed to load token constants from tokenize module");
+            return -1;
+        }
     }
 
-    TOK_NL = get_int_attr(tokenize, "NL");
-    TOK_NEWLINE = get_int_attr(tokenize, "NEWLINE");
-    TOK_INDENT = get_int_attr(tokenize, "INDENT");
-    TOK_DEDENT = get_int_attr(tokenize, "DEDENT");
-    TOK_COMMENT = get_int_attr(tokenize, "COMMENT");
-    TOK_STRING = get_int_attr(tokenize, "STRING");
-    TOK_ENDMARKER = get_int_attr(tokenize, "ENDMARKER");
+#if PY_VERSION_HEX >= 0x030D0000
+    _speedups_initialized = 1;
+    PyMutex_Unlock(&_speedups_init_mutex);
+#endif
 
-    Py_DECREF(tokenize);
+    return 0;  /* Success */
+}
 
-    /* Check if any attribute lookup failed */
-    if (TOK_NL < 0 || TOK_NEWLINE < 0 || TOK_INDENT < 0 ||
-        TOK_DEDENT < 0 || TOK_COMMENT < 0 || TOK_STRING < 0 ||
-        TOK_ENDMARKER < 0) {
-        Py_DECREF(NEWLINE_STR);
-        NEWLINE_STR = NULL;
-        PyErr_SetString(PyExc_RuntimeError,
-                        "Failed to load token constants from tokenize module");
-        return NULL;
-    }
 
-    return PyModule_Create(&speedupsmodule);
+/* Module slot definitions for multi-phase initialization */
+static PyModuleDef_Slot speedups_slots[] = {
+    {Py_mod_exec, speedups_exec},
+#if PY_VERSION_HEX >= 0x030D0000
+    /* Declare that this module supports free-threading (PEP 703) */
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+#endif
+#if PY_VERSION_HEX >= 0x030C0000
+    /* Support multiple interpreters (Python 3.12+) */
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+#endif
+    {0, NULL}
+};
+
+
+/* Module definition - using multi-phase initialization */
+static struct PyModuleDef speedupsmodule = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "_speedups",
+    .m_doc = "Flake8 performance-critical functions implemented in C.\n\n"
+             "This module provides optimized implementations of hot-spot\n"
+             "functions identified through profiling. It supports Python 3.13+\n"
+             "free-threading mode (PEP 703).",
+    .m_size = 0,  /* No per-module state needed; globals are immutable after init */
+    .m_methods = SpeedupsMethods,
+    .m_slots = speedups_slots,
+};
+
+
+/* Module initialization - returns module def for multi-phase init */
+PyMODINIT_FUNC
+PyInit__speedups(void)
+{
+    return PyModuleDef_Init(&speedupsmodule);
 }
