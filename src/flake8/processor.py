@@ -13,9 +13,19 @@ from flake8 import defaults
 from flake8 import utils
 from flake8._compat import FSTRING_END
 from flake8._compat import FSTRING_MIDDLE
+from flake8._compat import FSTRING_START
 from flake8._compat import TSTRING_END
 from flake8._compat import TSTRING_MIDDLE
+from flake8._compat import TSTRING_START
 from flake8.plugins.finder import LoadedPlugin
+
+# Try to import the C extension for performance-critical functions
+try:
+    from flake8 import _speedups
+    _USE_SPEEDUPS = True
+except ImportError:
+    _speedups = None  # type: ignore[assignment]
+    _USE_SPEEDUPS = False
 
 LOG = logging.getLogger(__name__)
 NEWLINE = frozenset([tokenize.NL, tokenize.NEWLINE])
@@ -189,8 +199,26 @@ class FileProcessor:
         self.blank_lines = 0
         self.tokens = []
 
-    def build_logical_line_tokens(self) -> _Logical:  # noqa: C901
-        """Build the mapping, comments, and logical line lists."""
+    def build_logical_line_tokens(self) -> _Logical:
+        """Build the mapping, comments, and logical line lists.
+
+        Uses C extension if available for better performance.
+        """
+        if _USE_SPEEDUPS:
+            try:
+                return _speedups.build_logical_line_tokens(
+                    self.tokens,
+                    self.lines,
+                    FSTRING_MIDDLE,
+                    TSTRING_MIDDLE,
+                )
+            except Exception:
+                # Fall back to Python implementation on any error
+                pass
+        return self._build_logical_line_tokens_python()
+
+    def _build_logical_line_tokens_python(self) -> _Logical:  # noqa: C901
+        """Build the mapping, comments, and logical line lists (Python impl)."""
         logical = []
         comments = []
         mapping: _LogicalMapping = []
