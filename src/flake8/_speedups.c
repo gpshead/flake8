@@ -17,6 +17,9 @@
 #define TOK_STRING 3
 #define TOK_ENDMARKER 0
 
+/* Cached Python objects for performance */
+static PyObject* NEWLINE_STR = NULL;
+
 /* Forward declarations */
 static PyObject* build_logical_line_tokens(PyObject* self, PyObject* args);
 static PyObject* mutate_string(PyObject* self, PyObject* args);
@@ -32,29 +35,33 @@ static PyObject* noqa_line_mapping(PyObject* self, PyObject* args);
  *   '"abc"' -> '"xxx"'
  *   "'''abc'''" -> "'''xxx'''"
  *   "r'abc'" -> "r'xxx'"
+ *
+ * This implementation works with Unicode characters, not bytes.
  */
 static PyObject*
 mutate_string(PyObject* self, PyObject* args)
 {
-    const char* text;
-    Py_ssize_t text_len;
+    PyObject* text_obj;
 
-    if (!PyArg_ParseTuple(args, "s#", &text, &text_len)) {
+    if (!PyArg_ParseTuple(args, "U", &text_obj)) {
         return NULL;
     }
 
+    Py_ssize_t text_len = PyUnicode_GET_LENGTH(text_obj);
+
     if (text_len < 2) {
         /* String too short to have quotes */
-        return PyUnicode_FromStringAndSize(text, text_len);
+        Py_INCREF(text_obj);
+        return text_obj;
     }
 
     /* Find the quote character (last char of string) */
-    char quote_char = text[text_len - 1];
+    Py_UCS4 quote_char = PyUnicode_READ_CHAR(text_obj, text_len - 1);
 
     /* Find start position after any prefix and opening quotes */
     Py_ssize_t start = 0;
     for (start = 0; start < text_len; start++) {
-        if (text[start] == quote_char) {
+        if (PyUnicode_READ_CHAR(text_obj, start) == quote_char) {
             start++;
             break;
         }
@@ -64,43 +71,59 @@ mutate_string(PyObject* self, PyObject* args)
 
     /* Check for triple-quoted strings */
     if (text_len >= 6 &&
-        text[text_len - 1] == text[text_len - 2] &&
-        text[text_len - 2] == text[text_len - 3] &&
-        (text[text_len - 1] == '"' || text[text_len - 1] == '\'')) {
+        PyUnicode_READ_CHAR(text_obj, text_len - 1) ==
+            PyUnicode_READ_CHAR(text_obj, text_len - 2) &&
+        PyUnicode_READ_CHAR(text_obj, text_len - 2) ==
+            PyUnicode_READ_CHAR(text_obj, text_len - 3) &&
+        (quote_char == '"' || quote_char == '\'')) {
         start += 2;
         end -= 2;
     }
 
-    /* Calculate size of result */
-    Py_ssize_t prefix_len = start;
-    Py_ssize_t suffix_len = text_len - end;
+    /* Calculate size of x fill */
     Py_ssize_t x_count = end - start;
-
     if (x_count < 0) x_count = 0;
 
-    Py_ssize_t result_len = prefix_len + x_count + suffix_len;
+    /* Build result: prefix + 'x' * x_count + suffix */
+    /* Get prefix (text[:start]) */
+    PyObject* prefix = PyUnicode_Substring(text_obj, 0, start);
+    if (prefix == NULL) return NULL;
 
-    /* Build result string */
-    char* result = PyMem_Malloc(result_len + 1);
-    if (result == NULL) {
-        return PyErr_NoMemory();
+    /* Get suffix (text[end:]) */
+    PyObject* suffix = PyUnicode_Substring(text_obj, end, text_len);
+    if (suffix == NULL) {
+        Py_DECREF(prefix);
+        return NULL;
     }
 
-    /* Copy prefix */
-    memcpy(result, text, prefix_len);
+    /* Create 'x' * x_count */
+    PyObject* x_fill = PyUnicode_New(x_count, 'x');
+    if (x_fill == NULL) {
+        Py_DECREF(prefix);
+        Py_DECREF(suffix);
+        return NULL;
+    }
+    /* Fill with 'x' characters */
+    int kind = PyUnicode_KIND(x_fill);
+    void* data = PyUnicode_DATA(x_fill);
+    for (Py_ssize_t i = 0; i < x_count; i++) {
+        PyUnicode_WRITE(kind, data, i, 'x');
+    }
 
-    /* Fill with 'x' */
-    memset(result + prefix_len, 'x', x_count);
+    /* Concatenate: prefix + x_fill + suffix */
+    PyObject* temp = PyUnicode_Concat(prefix, x_fill);
+    Py_DECREF(prefix);
+    Py_DECREF(x_fill);
+    if (temp == NULL) {
+        Py_DECREF(suffix);
+        return NULL;
+    }
 
-    /* Copy suffix */
-    memcpy(result + prefix_len + x_count, text + end, suffix_len);
+    PyObject* result = PyUnicode_Concat(temp, suffix);
+    Py_DECREF(temp);
+    Py_DECREF(suffix);
 
-    result[result_len] = '\0';
-
-    PyObject* py_result = PyUnicode_FromStringAndSize(result, result_len);
-    PyMem_Free(result);
-
-    return py_result;
+    return result;
 }
 
 
@@ -241,9 +264,9 @@ is_multiline_string(PyObject* self, PyObject* args)
     /* Check if STRING with newline */
     if (token_type == TOK_STRING) {
         PyObject* py_text = PyTuple_GET_ITEM(token, 1);
-        if (PyUnicode_Check(py_text)) {
+        if (PyUnicode_Check(py_text) && NEWLINE_STR != NULL) {
             Py_ssize_t idx = PyUnicode_Find(py_text,
-                PyUnicode_FromString("\n"), 0, PyUnicode_GET_LENGTH(py_text), 1);
+                NEWLINE_STR, 0, PyUnicode_GET_LENGTH(py_text), 1);
             if (idx >= 0) {
                 Py_RETURN_TRUE;
             }
@@ -692,5 +715,11 @@ static struct PyModuleDef speedupsmodule = {
 PyMODINIT_FUNC
 PyInit__speedups(void)
 {
+    /* Initialize cached Python objects */
+    NEWLINE_STR = PyUnicode_FromString("\n");
+    if (NEWLINE_STR == NULL) {
+        return NULL;
+    }
+
     return PyModule_Create(&speedupsmodule);
 }
