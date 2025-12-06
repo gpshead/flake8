@@ -34,6 +34,16 @@ jobs:
         - os: windows-latest
           python: '3.10'
           toxenv: py
+        - os: windows-latest
+          python: '3.12'
+          toxenv: py
+        # macos (tests C extension build on different platform)
+        - os: macos-latest
+          python: '3.11'
+          toxenv: py
+        - os: macos-latest
+          python: '3.12'
+          toxenv: py
         # misc
         - os: ubuntu-latest
           python: '3.10'

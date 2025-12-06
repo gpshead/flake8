@@ -8,17 +8,39 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-/* Token type constants - must match tokenize module (Python 3.11+) */
-#define TOK_NL 62
-#define TOK_NEWLINE 4
-#define TOK_INDENT 5
-#define TOK_DEDENT 6
-#define TOK_COMMENT 61
-#define TOK_STRING 3
-#define TOK_ENDMARKER 0
+/*
+ * Token type constants - dynamically loaded from tokenize module at init.
+ * This ensures compatibility across Python versions where token values may differ.
+ */
+static int TOK_NL = -1;
+static int TOK_NEWLINE = -1;
+static int TOK_INDENT = -1;
+static int TOK_DEDENT = -1;
+static int TOK_COMMENT = -1;
+static int TOK_STRING = -1;
+static int TOK_ENDMARKER = -1;
 
 /* Cached Python objects for performance */
 static PyObject* NEWLINE_STR = NULL;
+
+/*
+ * Helper to get an integer attribute from a module.
+ * Returns -1 and sets error on failure.
+ */
+static int
+get_int_attr(PyObject* module, const char* name)
+{
+    PyObject* attr = PyObject_GetAttrString(module, name);
+    if (attr == NULL) {
+        return -1;
+    }
+    int value = (int)PyLong_AsLong(attr);
+    Py_DECREF(attr);
+    if (PyErr_Occurred()) {
+        return -1;
+    }
+    return value;
+}
 
 /* Forward declarations */
 static PyObject* build_logical_line_tokens(PyObject* self, PyObject* args);
@@ -718,6 +740,35 @@ PyInit__speedups(void)
     /* Initialize cached Python objects */
     NEWLINE_STR = PyUnicode_FromString("\n");
     if (NEWLINE_STR == NULL) {
+        return NULL;
+    }
+
+    /* Load token type constants from tokenize module */
+    PyObject* tokenize = PyImport_ImportModule("tokenize");
+    if (tokenize == NULL) {
+        Py_DECREF(NEWLINE_STR);
+        NEWLINE_STR = NULL;
+        return NULL;
+    }
+
+    TOK_NL = get_int_attr(tokenize, "NL");
+    TOK_NEWLINE = get_int_attr(tokenize, "NEWLINE");
+    TOK_INDENT = get_int_attr(tokenize, "INDENT");
+    TOK_DEDENT = get_int_attr(tokenize, "DEDENT");
+    TOK_COMMENT = get_int_attr(tokenize, "COMMENT");
+    TOK_STRING = get_int_attr(tokenize, "STRING");
+    TOK_ENDMARKER = get_int_attr(tokenize, "ENDMARKER");
+
+    Py_DECREF(tokenize);
+
+    /* Check if any attribute lookup failed */
+    if (TOK_NL < 0 || TOK_NEWLINE < 0 || TOK_INDENT < 0 ||
+        TOK_DEDENT < 0 || TOK_COMMENT < 0 || TOK_STRING < 0 ||
+        TOK_ENDMARKER < 0) {
+        Py_DECREF(NEWLINE_STR);
+        NEWLINE_STR = NULL;
+        PyErr_SetString(PyExc_RuntimeError,
+                        "Failed to load token constants from tokenize module");
         return NULL;
     }
 

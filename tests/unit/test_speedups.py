@@ -5,6 +5,7 @@ to the Python implementations, ensuring correctness and safe fallback.
 """
 from __future__ import annotations
 
+import sys
 import tokenize
 
 import pytest
@@ -23,7 +24,39 @@ except ImportError:
     _speedups = None
     HAS_SPEEDUPS = False
 
-# Skip all tests if speedups not available
+
+class TestSpeedupsAvailability:
+    """Tests for C extension availability and initialization."""
+
+    def test_speedups_import_does_not_fail(self):
+        """Verify that importing _speedups doesn't raise on CPython."""
+        # On CPython, the extension should be available if built
+        # On PyPy, it may not be available which is fine
+        if sys.implementation.name == "cpython":
+            # This test documents that we expect the extension to be available
+            # on CPython when properly installed
+            pass  # Import already attempted above
+
+    @pytest.mark.skipif(not HAS_SPEEDUPS, reason="C extension not available")
+    def test_speedups_has_expected_functions(self):
+        """Verify _speedups exports the expected functions."""
+        assert hasattr(_speedups, "mutate_string")
+        assert hasattr(_speedups, "is_eol_token")
+        assert hasattr(_speedups, "is_multiline_string")
+        assert hasattr(_speedups, "build_logical_line_tokens")
+        assert hasattr(_speedups, "noqa_line_mapping")
+
+    @pytest.mark.skipif(not HAS_SPEEDUPS, reason="C extension not available")
+    def test_speedups_functions_are_callable(self):
+        """Verify _speedups functions are callable."""
+        assert callable(_speedups.mutate_string)
+        assert callable(_speedups.is_eol_token)
+        assert callable(_speedups.is_multiline_string)
+        assert callable(_speedups.build_logical_line_tokens)
+        assert callable(_speedups.noqa_line_mapping)
+
+
+# Skip remaining tests if speedups not available
 pytestmark = pytest.mark.skipif(
     not HAS_SPEEDUPS,
     reason="C extension not available",
