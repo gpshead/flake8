@@ -2,6 +2,7 @@
 *.egg-info
 *.log
 *.pyc
+*.so
 *.sw*
 *.zip
 .cache
